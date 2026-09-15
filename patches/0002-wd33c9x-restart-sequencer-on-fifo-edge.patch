@@ -1,0 +1,66 @@
+diff --git a/src/devices/machine/wd33c9x.cpp b/src/devices/machine/wd33c9x.cpp
+index 8ff02f2e..86517242 100644
+--- a/src/devices/machine/wd33c9x.cpp
++++ b/src/devices/machine/wd33c9x.cpp
+@@ -29,7 +29,7 @@
+ #define LOG_REGS        (LOG_READS | LOG_WRITES)
+ #define LOG_ALL         (LOG_REGS | LOG_COMMANDS | LOG_ERRORS | LOG_MISC | LOG_LINES | LOG_STATE | LOG_STEP)
+ 
+-#define VERBOSE         (0)
++#define VERBOSE         (LOG_COMMANDS | LOG_ERRORS)
+ #include "logmacro.h"
+ 
+ enum register_addresses_e : uint8_t {
+@@ -690,9 +690,15 @@ void wd33c9x_base_device::reset_w(int state)
+ 
+ uint8_t wd33c9x_base_device::dma_r()
+ {
++	const bool was_full = data_fifo_full();
+ 	const uint8_t ret = data_fifo_pop();
+ 	decrement_transfer_count();
+ 	clear_drq();
++	// draining a full FIFO has to restart the sequencer, the same way the
++	// programmed-I/O path does: without this the chip stalls for good if the
++	// host ever pauses long enough to fill it
++	if (was_full)
++		step(false);
+ 	return ret;
+ }
+ 
+@@ -703,9 +709,14 @@ uint8_t wd33c9x_base_device::dma_r()
+ 
+ void wd33c9x_base_device::dma_w(const uint8_t data)
+ {
++	const bool was_empty = data_fifo_empty();
+ 	data_fifo_push(data);
+ 	decrement_transfer_count();
+ 	clear_drq();
++	// filling an empty FIFO has to restart the sequencer, the same way the
++	// programmed-I/O path does
++	if (was_empty)
++		step(false);
+ }
+ 
+ 
+@@ -1278,7 +1289,20 @@ void wd33c9x_base_device::step(bool timeout)
+ 			case ((S_PHASE_MSG_OUT << 3) | S_PHASE_MSG_OUT):
+ 			case ((S_PHASE_COMMAND << 3) | S_PHASE_COMMAND):
+ 			case ((S_PHASE_MSG_IN  << 3) | S_PHASE_MSG_IN):
+-				next_state = INIT_XFR;
++				// A Transfer Info command completes when the transfer count is
++				// exhausted, whatever the phase, not only in the data phases.
++				// A driver that drives the phases by hand (IDENTIFY and SDTR
++				// first, then the CDB, one Transfer Info at a time) waits for
++				// the interrupt that completion raises; without this it hangs
++				// with DBR set while the chip waits for bytes that never come.
++				if (!sat && cc == COMMAND_CC_TRANSFER_INFO && m_transfer_count == 0
++					&& ((m_xfr_phase & 1) || data_fifo_empty())) {
++					next_state = FINISHED;
++					irq_fifo_push(SCSI_STATUS_TRANSFER_SUCCESS | m_xfr_phase);
++				}
++				else {
++					next_state = INIT_XFR;
++				}
+ 				break;
+ 
+ 			case ((S_PHASE_DATA_IN  << 3) | S_PHASE_DATA_IN):

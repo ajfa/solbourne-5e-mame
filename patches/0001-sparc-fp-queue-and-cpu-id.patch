@@ -1,0 +1,216 @@
+diff --git a/src/devices/cpu/sparc/sparc.cpp b/src/devices/cpu/sparc/sparc.cpp
+index b0204127..6d284de8 100644
+--- a/src/devices/cpu/sparc/sparc.cpp
++++ b/src/devices/cpu/sparc/sparc.cpp
+@@ -260,9 +260,9 @@ void sparc_base_device::device_start()
+ #endif
+ 
+ 	NWINDOWS = m_nwindows_cfg;
+-	PSR = 0;
+-	m_ver = 0;
+-	m_impl = 0;
++	PSR = (uint32_t(m_impl_cfg) << PSR_IMPL_SHIFT) | (uint32_t(m_ver_cfg) << PSR_VER_SHIFT);
++	m_ver = m_ver_cfg;
++	m_impl = m_impl_cfg;
+ 
+ 	m_bp_reset_in = false;
+ 	m_bp_fpu_present = m_fpu_present_cfg;
+@@ -455,6 +455,9 @@ void sparc_base_device::device_start()
+ 	save_item(NAME(m_fp_exception_pending));
+ 	save_item(NAME(m_fpr_pending));
+ 	save_item(NAME(m_pending_fpr));
++	save_item(NAME(m_fpu_exception_mode));
++	save_item(NAME(m_fq_addr));
++	save_item(NAME(m_fq_insn));
+ 	save_item(NAME(m_cp_exception));
+ 	save_item(NAME(m_instruction_access_exception));
+ 	save_item(NAME(m_data_access_exception));
+@@ -525,6 +528,9 @@ void sparc_base_device::device_reset()
+ 	m_fp_exception_pending = false;
+ 	m_fpr_pending = 0;
+ 	m_pending_fpr = std::size(m_fpr);
++	m_fpu_exception_mode = 0;
++	m_fq_addr = 0;
++	m_fq_insn = 0;
+ 	m_cp_exception = false;
+ 	m_instruction_access_exception = false;
+ 	m_data_access_exception = false;
+@@ -2022,7 +2028,10 @@ inline void sparc_base_device::execute_group2(uint32_t op)
+ 			{
+ 				m_trap = 1;
+ 				m_fp_disabled = 1;
++				return;
+ 			}
++			if (fq_blocks())
++				return;
+ 			complete_fp_execution(op);
+ 			return;
+ 
+@@ -2203,6 +2212,9 @@ void sparc_base_device::execute_store(uint32_t op)
+ 		m_fp_disabled = 1;
+ 		return;
+ 	}
++
++	if ((STF || STDF) && fq_blocks())
++		return;
+ 	if ((STC || STDC || STCSR || STDCQ) && (!(PSR & PSR_EC_MASK) || !m_bp_cp_present))
+ 	{
+ 		m_trap = 1;
+@@ -2229,9 +2241,12 @@ void sparc_base_device::execute_store(uint32_t op)
+ 		return;
+ 	}
+ 
+-	if (STDFQ)
++	if (STDFQ && !(FSR & FSR_QNE))
+ 	{
+-		// assume no floating-point queue for now
++		// nothing is queued: the store does nothing, but the instruction
++		// still has to retire or the CPU spins on it forever
++		PC = nPC;
++		nPC = nPC + 4;
+ 		return;
+ 	}
+ 	if (STDCQ)
+@@ -2285,8 +2300,10 @@ void sparc_base_device::execute_store(uint32_t op)
+ 	else if (STDFQ)
+ 	{
+ 		//byte_mask = 15;
+-		data0 = 0;
+-		data1 = 0;
++		data0 = m_fq_addr;
++		data1 = m_fq_insn;
++		FSR &= ~FSR_QNE;
++		m_fpu_exception_mode = 0;
+ 	}
+ 	else if (STDCQ)
+ 	{
+@@ -2575,6 +2592,9 @@ inline void sparc_base_device::execute_lddfpr(uint32_t op)
+ 		return;
+ 	}
+ 
++	if (fq_blocks())
++		return;
++
+ 	if (address & 7)
+ 	{
+ 		m_trap = 1;
+@@ -2627,6 +2647,9 @@ inline void sparc_base_device::execute_ldfpr(uint32_t op)
+ 		return;
+ 	}
+ 
++	if (fq_blocks())
++		return;
++
+ 	if (address & 3)
+ 	{
+ 		m_trap = 1;
+@@ -3727,6 +3750,8 @@ inline void sparc_base_device::dispatch_instruction(uint32_t op)
+ 				m_fp_disabled = 1;
+ 				return;
+ 			}
++			if (fq_blocks())
++				return;
+ 			execute_fbfcc(op);
+ 			break;
+ 		default:
+@@ -3796,13 +3821,37 @@ void sparc_base_device::check_fdiv_zero_exception()
+ 	m_fsr |= FSR_CEXC_DZC;
+ 	if (m_fsr & FSR_TEM_DZM)
+ 	{
+-		m_fsr = (m_fsr & ~FSR_FTT_MASK) | FSR_FTT_IEEE;
++		m_fsr = (m_fsr & ~FSR_FTT_MASK) | FSR_FTT_IEEE | FSR_QNE;
++		m_fpu_exception_mode = 1;
+ 		m_fp_exception_pending = true;
+ 		return;
+ 	}
+ 	m_fsr |= FSR_AEXC_DZA;
+ }
+ 
++// A deferred exception leaves the queue loaded. Until software drains it with
++// STDFQ, any floating-point instruction other than a load or store of the FSR
++// delivers the trap. Delivering it here calls off the countdown that would
++// otherwise deliver the same exception a few instructions later.
++bool sparc_base_device::fq_blocks()
++{
++	if (!m_fpu_exception_mode)
++		return false;
++
++	// the first one delivers the exception that is already queued; any
++	// further floating-point instruction is a sequence error
++	if (m_fpu_exception_mode == 2)
++		m_fsr = (m_fsr & ~FSR_FTT_MASK) | FSR_FTT_SEQ;
++	m_fpu_exception_mode = 2;
++
++	m_fp_exception_pending = false;
++	m_fpr_pending = 0;
++	m_pending_fpr = std::size(m_fpr);
++	m_trap = 1;
++	m_fp_exception = 1;
++	return true;
++}
++
+ bool sparc_base_device::check_fp_exceptions()
+ {
+ 	if (softfloat_exceptionFlags & softfloat_flag_inexact)
+@@ -3822,7 +3871,8 @@ bool sparc_base_device::check_fp_exceptions()
+ 	// check if exception is enabled
+ 	if (tem & cexc)
+ 	{
+-		m_fsr = (m_fsr & ~FSR_FTT_MASK) | FSR_FTT_IEEE;
++		m_fsr = (m_fsr & ~FSR_FTT_MASK) | FSR_FTT_IEEE | FSR_QNE;
++		m_fpu_exception_mode = 1;
+ 		m_fp_exception = 1;
+ 		return true;
+ 	}
+@@ -3889,6 +3939,10 @@ void sparc_base_device::complete_fp_execution(uint32_t op)
+ {
+ 	softfloat_exceptionFlags = 0;
+ 
++	// la cola de la unidad guarda la instruccion que provoque la excepcion
++	m_fq_addr = PC;
++	m_fq_insn = op;
++
+ 	uint32_t rs1 = 0;
+ 	uint32_t rs2 = 0;
+ 	uint64_t rd1 = 0;
+@@ -4436,6 +4490,7 @@ inline void sparc_base_device::execute_step()
+ 				if (m_fp_exception_pending)
+ 				{
+ 					m_fp_exception_pending = false;
++					m_fpu_exception_mode = 2;
+ 					m_trap = 1;
+ 					m_fp_exception = 1;
+ 					return;
+diff --git a/src/devices/cpu/sparc/sparc.h b/src/devices/cpu/sparc/sparc.h
+index f8982e0c..84fe594f 100644
+--- a/src/devices/cpu/sparc/sparc.h
++++ b/src/devices/cpu/sparc/sparc.h
+@@ -26,6 +26,7 @@ public:
+ 	template <typename T> void set_mmu(T &&tag) { m_mmu.set_tag(std::forward<T>(tag)); }
+ 	void set_nwindows(int n) { m_nwindows_cfg = n; }
+ 	void set_fpu_present(bool state) { m_fpu_present_cfg = state; }
++	void set_impl_ver(int impl, int ver) { m_impl_cfg = impl; m_ver_cfg = ver; }
+ 	bool in_error_mode() const { return m_error_mode; }
+ 	bool dword_access() const { return m_dword_access; }
+ 	bool atomic_access() const { return m_atomic_access; }
+@@ -214,6 +215,11 @@ protected:
+ 	bool m_fp_exception_pending;
+ 	uint32_t m_fpr_pending;
+ 	uint32_t m_pending_fpr;
++	bool fq_blocks();
++
++	uint8_t m_fpu_exception_mode;   // 0 execute, 1 exception pending, 2 exception
++	uint32_t m_fq_addr;
++	uint32_t m_fq_insn;
+ 	bool m_cp_exception;
+ 	bool m_instruction_access_exception;
+ 	bool m_data_access_exception;
+@@ -251,6 +257,8 @@ protected:
+ 	int m_nwindows;
+ 	int m_nwindows_cfg = 7;
+ 	bool m_fpu_present_cfg = true;
++	int m_impl_cfg = 0;
++	int m_ver_cfg = 0;
+ 
+ 	// other internal states
+ 	bool m_privileged_asr[32];
