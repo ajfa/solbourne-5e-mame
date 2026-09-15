@@ -17,6 +17,10 @@ Emulated: the CPU with its FPU, the MMU with both translation windows, memory
 with its ECC, the WD33C93A SCSI controller with hard disks, the real time
 clock and both Z8530 serial controllers. The console is serial port A.
 
+One processor. The real machine was SMP and OS/MP is genuinely multiprocessor,
+but the driver puts a single CY7C601 in KBus slot 3 and the PROM reports
+`One CPU (slot 3)`.
+
 Not emulated: the LANCE Ethernet controller, the frame buffer and the
 Solbourne keyboard.
 
@@ -76,6 +80,58 @@ The driver takes the system disk as `-hard1` and a second SCSI device as
 
 At the `ROM>` prompt, `boot sd.si(,0,)vmunix` starts the system, and `-s`
 after it gives single user.
+
+## The console line
+
+The PROM drives serial port A at 9600 8N1. Once `init` takes over, the SunOS
+tty driver puts the line in seven bits with even parity, so every byte from
+there to the login prompt arrives with the eighth bit set: a terminal wired for
+8N1 shows `s` as 0xF3. Two changes on the installed system settle it:
+
+- In `/etc/ttytab`, use the `cons8` getty entry for the console. The install
+  leaves it commented out one line above the `std.9600` one it does use.
+- At the top of `/etc/rc`, add `stty pass8 < /dev/console > /dev/console`.
+
+Do not put that line in `/etc/rc.boot`. It runs before `/usr` is mounted and
+`stty` lives in `/usr/bin`, so all it does is print `stty: not found`.
+
+The console device itself comes from an EEPROM variable. The system board ID
+PROM ships with `CONSOLE=zs()`, which is the serial port.
+
+## What a frame buffer would take
+
+SunView runs on the on-board frame buffer, and the guest side is ready for
+it. The PROM lists the board in its slot table:
+
+    7    G0   AG    BW20 Monochrome Frame Buffer
+
+the kernel carries a `bwtwo` driver with a Solbourne id string in it, and an
+installed system already has `/dev/bwtwo0`, `/dev/kbd` and `/dev/mouse`.
+
+What the driver has today:
+
+- The frame buffer memory, 256 KB, and the VIDMAP register at offset 0x200000
+  of the system board slot, which maps that memory into a KBus space of its
+  own. Reads and writes reach it.
+- The second Z8530, the keyboard and mouse pair of ports, instantiated with its
+  interrupt wired to line b. Nothing is attached to it.
+
+What is missing:
+
+- A screen device and a screen update that draws the frame buffer memory as a
+  monochrome bitmap. The geometry is not confirmed. 256 KB is a good deal more
+  than the 129,600 bytes a 1152x900 mono display needs, so the decode is worth
+  measuring against the kernel's own `bwtwo` driver rather than assumed.
+- Whatever control registers the BW20 has besides plain memory. A frame buffer
+  of this generation usually has at least a video enable and a vertical retrace
+  interrupt. Neither has been located yet.
+- A keyboard and a mouse on that second Z8530. MAME has Sun keyboard and mouse
+  devices to hang there. The ID PROM carries `KBD_LAYOUT=0` and a full key
+  translation table, so the PROM expects a local keyboard.
+
+The screen alone is a good first step, because it checks itself. The kernel
+prints `Changing Console to bwtwo0` when it moves the console off the serial
+line, so a working screen shows the tail of the boot with no keyboard involved.
 
 ## License
 
