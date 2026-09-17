@@ -81,6 +81,39 @@ The driver takes the system disk as `-hard1` and a second SCSI device as
 At the `ROM>` prompt, `boot sd.si(,0,)vmunix` starts the system, and `-s`
 after it gives single user.
 
+## Building the system disk
+
+The disk this boots from is not here: it is Solbourne's OS/MP, and it is made by
+running their own installer inside the emulator.
+
+**The medium.** OS/MP 4.1C Export comes on tape, and what the installer reads here
+is that tape dumped into a disk image. The layout, measured: a Sun label for a
+Seagate ST11200, 1868 cylinders, 15 heads, 73 sectors, a single `a` partition of
+175 MB, and inside it a plain UFS holding the tape's files, `TOC`,
+`Install.Series5`, `Miniusr`, `Root.tar`, `Usr.tar`, `Kvm.Series5.tar` and the
+optional sets. The dump is not redistributed here.
+
+**The installer will not read a disk.** It offers tape, CD-ROM or network and
+nothing else, so the medium is attached as the second SCSI device and answered for
+as a tape. Its menu fields come pre-filled with whatever was typed before, and the
+old value has to be cleared before typing over it.
+
+**Three things have to be done to the new disk afterwards**, or the machine does not
+come up the way it should:
+
+- Remove `kvm/stand/dg`. With that file in place the PROM starts the diagnostic by
+  itself instead of dropping to `ROM>`.
+- Put `stty pass8 < /dev/console > /dev/console` at the top of `/etc/rc.boot` and of
+  `/etc/rc`, and use the `cons8` getty entry in `/etc/ttytab`. The next section says
+  why.
+- Leave a device at SCSI target 1. With a single disk the kernel takes a page fault
+  as soon as `init` hands control to the boot scripts, which is the first of the
+  known problems above.
+
+The system behind this README answers to `root`, calls itself `solbourne`, has no
+network configured and runs in GMT. From power on to the login prompt is about
+forty five seconds.
+
 ## The console line
 
 The PROM drives serial port A at 9600 8N1. Once `init` takes over, the SunOS
